@@ -1,0 +1,529 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+use POSIX qw/:errno_h BUFSIZ/;
+use Sys::Syslog qw/:standard :macros/;
+use Config::Simple;
+use URI;
+use Fcntl qw/:mode/;
+use Fuse;
+use Net::LDAP;
+use Socket qw/IPPROTO_TCP SOL_SOCKET SO_KEEPALIVE SO_RCVTIMEO SO_SNDTIMEO/;
+use Time::Local;
+
+#use Data::Dumper;
+
+# /usr/include/sysexits.h
+use constant EX_OK		=> 0;	# successful termination
+use constant EX_USAGE		=> 64;	# command line usage error
+use constant EX_DATAERR		=> 65;	# data format error
+use constant EX_NOINPUT		=> 66;	# cannot open input
+use constant EX_NOUSER		=> 67;	# addressee unknown
+use constant EX_NOHOST		=> 68;	# host name unknown
+use constant EX_UNAVAILABLE	=> 69;	# service unavailable
+use constant EX_SOFTWARE	=> 70;	# internal software error
+use constant EX_OSERR		=> 71;	# system error (e.g., can't fork)
+use constant EX_OSFILE		=> 72;	# critical OS file missing
+use constant EX_CANTCREAT	=> 73;	# can't create (user) output file
+use constant EX_IOERR		=> 74;	# input/output error
+use constant EX_TEMPFAIL	=> 75;	# temp failure; user is invited to retry
+use constant EX_PROTOCOL	=> 76;	# remote error in protocol
+use constant EX_NOPERM		=> 77;	# permission denied
+use constant EX_CONFIG		=> 78;	# configuration error
+
+our %sys2err = (
+	(EX_OK)			=> 0,
+	(EX_USAGE)		=> EINVAL,
+	(EX_DATAERR)		=> EFAULT,
+	(EX_NOINPUT)		=> EINVAL,
+	(EX_NOUSER)		=> ENXIO,
+	(EX_NOHOST)		=> ENXIO,
+	(EX_UNAVAILABLE)	=> EAGAIN,
+	(EX_SOFTWARE)		=> EAGAIN,
+	(EX_OSERR)		=> EAGAIN,
+	(EX_OSFILE)		=> EAGAIN,
+	(EX_CANTCREAT)		=> ENOENT,
+	(EX_IOERR)		=> EIO,
+	(EX_TEMPFAIL)		=> EAGAIN,
+	(EX_PROTOCOL)		=> EAGAIN,
+	(EX_NOPERM)		=> EPERM,
+	(EX_CONFIG)		=> EFAULT,
+);
+
+our %c;
+our $ldap;
+our $timestamp = 0;
+our %live;
+our %cache;
+
+shift @ARGV
+	if ($ARGV[0] eq '');
+if (scalar(@ARGV) < 3) {
+	print STDERR "not enough arguments\n";
+	exit EX_USAGE;
+}
+my $mountpoint = $ARGV[0];
+unless ($ARGV[1] eq '-o') {
+	print STDERR "invalid arguments\n";
+	exit EX_USAGE;
+}
+my $opts = $ARGV[2];
+
+my $debug = ($opts =~ /(^|,)debug($|,)/)
+	? 1 : 0;
+my $verbose = ($opts =~ /(^|,)verbose($|,)/)
+	? 1 : 0;
+my $lpkconfig = ($opts =~ /(?:^|,)config=([^,]+)/)
+	? $1 : '/etc/ssh/lpkfuse';
+our $readwrite = ($opts =~ /(^|,)rw($|,)/)
+	? 1 : 0;
+
+my $rc = &loadcfg($lpkconfig);
+exit -$rc
+	if ($rc < 0);
+
+close STDIN;
+close STDOUT;
+
+my $pid = fork;
+unless (defined($pid)) {
+	print STDERR "fork(): $!\n";
+	exit EX_OSERR;
+} elsif ($pid > 0) {
+	exit EX_OK;
+}
+
+if (POSIX::setsid() < 0) {
+	print STDERR "setsid(): $!\n";
+	exit EX_OSERR;
+}
+
+unless (chdir("/")) {
+	print STDERR "chdir(\"/\"): $!\n";
+	exit EX_OSERR;
+}
+
+openlog basename($0), 'pid', LOG_AUTH;
+
+close STDERR
+	if ($debug == 0);
+
+setlogmask(LOG_UPTO(LOG_INFO))
+	if ($debug == 0 && $verbose == 0);
+
+syslog LOG_NOTICE, 'started';
+
+syslog LOG_WARNING, 'readwrite not supported'
+	if ($readwrite == 1);
+
+my %fuseopts = (
+	getattr		=> 'main::lpk_getattr',
+	readlink	=> 'main::lpk_readlink',
+	getdir		=> 'main::lpk_getdir',
+	open		=> 'main::lpk_open',
+	read		=> 'main::lpk_read',
+	statfs		=> 'main::lpk_statfs',
+	release		=> 'main::lpk_release',
+);
+
+$fuseopts{'debug'} = 1
+	if ($debug == 1);
+
+Fuse::main(mountopts => 'default_permissions,allow_other',
+		mountpoint => $mountpoint, %fuseopts);
+
+syslog LOG_NOTICE, 'exited';
+
+closelog;
+
+exit EX_OK;
+
+sub __fixup {
+	my ($file) = shift;
+
+	$file =~ s/^\///;
+	$file = '.'
+		if ($file eq '');
+
+	return lc $file;
+}
+
+sub lpk_getattr {
+	my ($file) = &__fixup(shift);
+
+	if ($file eq '.') {
+		my ($dev,$ino,$nlink,$uid,$gid,$rdev,$blksize,$blocks) = (0,0,1,0,0,0,BUFSIZ,0);
+
+		my $size = 0;
+		my $modes = S_IFDIR | S_IRUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+		my ($atime, $ctime, $mtime) = (0, 0, 0);
+
+		return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+	}
+
+	return -(ENOENT)
+		if ($file =~ /\//);
+
+	my @pwd = getpwnam $file;
+	unless (scalar(@pwd)) {
+		syslog LOG_DEBUG, "$file does not have a local account, ignoring";
+		return -(ENOENT)
+	}
+
+	my $e = &_fetchlogin($file);
+
+	if (ref($e) eq 'Net::LDAP::Entry') {
+		$cache{$file} = join "\n", @{$e->get_value('sshPublicKey', asref => 1)};
+	} elsif (!defined($cache{$file})) {
+		if (($e == -(ENOENT) || $e == -(EAGAIN))
+				&& stat("$pwd[7]/.ssh/authorized_keys")) {
+			my ($dev,$ino,$nlink,$uid,$gid,$rdev,$blksize,$blocks) = (0,0,1,0,0,0,BUFSIZ,0);
+
+			my $size = length "$pwd[7]/.ssh/authorized_keys";
+			my $modes = S_IFLNK | S_IRWXU | S_IRWXG | S_IRWXO;
+			my ($atime, $ctime, $mtime) = (0, 0, 0);
+
+			return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+		}
+
+		return $e;
+	}
+
+	my ($dev,$ino,$nlink,$uid,$gid,$rdev,$blksize) = (0,0,1,$pwd[2],$pwd[3],0,BUFSIZ);
+	my $modes = S_IFREG | S_IRUSR;
+	my $size = length $cache{$file};
+	my $blocks = int($size / $blksize);
+		$blocks++
+			if ($size % $blksize);
+
+	my ($atime, $ctime, $mtime) = (0, 0, 0);
+
+	return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+}
+
+sub lpk_open {
+	my ($file) = &__fixup(shift);
+	my ($flags) = @_;
+
+	# TODO check flags /usr/include/asm-generic/fcntl.h
+	return -(EISDIR)
+		if ($file eq '.');
+
+	return -(ENOENT)
+		if ($file =~ /\//);
+
+	unless (defined(getpwnam($file))) {
+		syslog LOG_DEBUG, "$file does not have a local account, ignoring";
+		return -(ENOENT);
+	}
+
+	my $e = &_fetchlogin($file);
+	unless (ref($e) eq 'Net::LDAP::Entry') {
+		if (defined($cache{$file})) {
+			$live{$file} = $cache{$file};
+			return EX_OK;
+		}
+
+		return $e;
+	}
+
+	$cache{$file} = $live{$file} = join "\n", @{$e->get_value('sshPublicKey', asref => 1)};
+
+	return EX_OK;
+}
+
+sub lpk_release {
+	my ($file) = &__fixup(shift);
+	my ($flags) = @_;
+
+	delete $live{$file};
+
+	return 0;
+}
+
+sub lpk_read {
+	my ($file) = &__fixup(shift);
+	my ($len, $off) = @_;
+
+	# FIXME this is actually an error
+	return -(ENOENT)
+		unless (defined($live{$file}));
+
+	return -(EINVAL)
+		if ($off > length $live{$file});
+
+	return 0
+		if ($len == length $live{$file});
+
+	return substr($live{$file}, $off, $len);
+}
+
+sub lpk_readlink {
+	my ($file) = &__fixup(shift);
+
+	my @pwd = getpwnam $file;
+	unless (scalar(@pwd)) {
+		syslog LOG_DEBUG, "$file does not have a local account, ignoring";
+		return -(ENOENT)
+	}
+
+	return "$pwd[7]/.ssh/authorized_keys";
+}
+
+sub lpk_getdir {
+	my ($file) = &__fixup(shift);
+
+	return -(ENOENT)
+		unless ($file eq '.');
+
+	my $rc = &_connect();
+	return -$sys2err{-$rc}
+		if ($rc < 0);
+
+	my $filter = "(&$c{'user.filter'}(objectClass=ldapPublicKey))";
+	my $mesg = $ldap->search(base => $c{'user.base'}, scope => 'sub',
+					filter => $filter,
+					attrs => [ $c{'user.key'}, 'sshPublicKey' ],
+					timelimit => $c{'server.timeout'} );
+	if ($mesg->code) {
+		syslog LOG_ERR, 'unable to do search: ' . $mesg->error;
+		return -$sys2err{(EX_TEMPFAIL)};
+	}
+
+	my %users;
+	my @files = ('.', '..');
+	foreach my $e ($mesg->entries) {
+		if (scalar(@{$e->get_value($c{'user.key'}, asref => 1)}) > 1) {
+			syslog LOG_INFO, $e->dn . " has multivalue $c{'user.key'}, ignoring";
+			next;
+		}
+
+		my $login = lc $e->get_value($c{'user.key'});
+		unless (defined(getpwnam($login))) {
+			syslog LOG_DEBUG, "$login does not have a local account, ignoring";
+			next;
+		}
+
+		$users{$login} = 1;
+		next unless (scalar(@{$e->get_value('sshPublicKey', asref => 1)}));
+
+		push @files, $login;
+	}
+
+	local *PASSWD;
+	$rc = open PASSWD, '<', '/etc/passwd';
+	if ($rc == 0) {
+		syslog LOG_WARNING, "unable to read /etc/passwd: $!";
+		return (@files, 0);
+	}
+
+	while (my $line = <PASSWD>) {
+		chomp $line;
+		my ($login, $passwd, $uid, $gid, $gcos, $home, $shell) = split /:/, $line, 7;
+
+		push @files, $login
+			if (!defined($users{$login}) && stat("$home/.ssh/authorized_keys"));
+	}
+	close PASSWD;
+
+	return (@files, 0);
+}
+
+sub lpk_statfs {
+	my @files = &lpk_getdir('.');
+
+	return (255, scalar(@files) - 2, 0, 1, 1, BUFSIZ);
+}
+
+sub _connect {
+	return EX_OK
+		if (defined($ldap) && ref($ldap) eq 'Net::LDAP'
+			&& defined($ldap->socket) && defined($ldap->socket->connected));
+
+	return -(EX_TEMPFAIL)
+		if ($timestamp > time);
+
+	$ldap = Net::LDAP->new($c{'server.uri'}, timeout => $c{'server.timeout'}, async => 1);
+	unless (defined($ldap)) {
+		syslog LOG_ERR, "unable to connect to LDAP server: $@";
+		$timestamp = time + (3*$c{'server.timeout'});
+		return -(EX_TEMPFAIL);
+	}
+
+	syslog LOG_WARNING, "setsockopt(SO_KEEPALIVE) failed: $!"
+		unless (defined($ldap->socket->setsockopt(IPPROTO_TCP, SO_KEEPALIVE, 1)));
+
+	my $timeval = pack 'l!l!', $c{'server.timeout'}, 0;
+	syslog LOG_WARNING, "setsockopt(SO_RCVTIMEO) failed: $!"
+		unless (defined($ldap->socket->setsockopt(SOL_SOCKET, SO_RCVTIMEO, $timeval)));
+	syslog LOG_WARNING, "setsockopt(SO_SNDTIMEO) failed: $!"
+		unless (defined($ldap->socket->setsockopt(SOL_SOCKET, SO_SNDTIMEO, $timeval)));
+
+	# TODO sasl support
+	my $mesg;
+	if (defined($c{'server.username'})) {
+		$mesg = $ldap->bind($c{'server.username'}, password => $c{'server.password'});
+	} else {
+		$mesg = $ldap->bind;
+	}
+	if ($mesg->code) {
+		syslog LOG_ERR, 'unable to bind to LDAP server: ' . $mesg->error;
+		$ldap->disconnect;
+		return -(EX_NOUSER);
+	}
+
+	my $rc = &_populateKeyCache();
+	return $rc
+		if ($rc < 0);
+
+	return EX_OK;
+}
+
+sub _fetchlogin {
+	my $login = shift;
+
+	my $rc = &_connect();
+	return -$sys2err{-$rc}
+		if ($rc < 0);
+
+	my $filter = "(&$c{'user.filter'}(objectClass=ldapPublicKey)(sshPublicKey=*)($c{'user.key'}=$login))";
+	my $mesg = $ldap->search(base => $c{'user.base'}, scope => 'sub',
+					filter => $filter,
+					attrs => [ $c{'user.key'}, 'sshPublicKey' ],
+					timelimit => $c{'server.timeout'} );
+	if ($mesg->code) {
+		syslog LOG_ERR, 'unable to do search: ' . $mesg->error;
+		return -$sys2err{(EX_TEMPFAIL)};
+	}
+
+	return -(ENOENT)
+		if (scalar($mesg->entries) == 0);
+	if (scalar($mesg->entries) > 1) {
+		syslog LOG_INFO, "more than one result for $login, ignoring";
+		return -(ENODATA);
+	}
+
+	my $e = $mesg->shift_entry;
+	if (scalar(@{$e->get_value($c{'user.key'}, asref => 1)}) > 1) {
+		syslog LOG_INFO, $e->dn . " has multivalue $c{'user.key'}, ignoring";
+		return -(EFAULT);
+	}
+
+	return $e;
+}
+
+sub _populateKeyCache {
+	my $filter = "(&$c{'user.filter'}(objectClass=ldapPublicKey)(sshPublicKey=*))";
+	my $mesg = $ldap->search(base => $c{'user.base'}, scope => 'sub',
+					filter => $filter,
+					attrs => [ $c{'user.key'}, 'sshPublicKey' ],
+					timelimit => $c{'server.timeout'} );
+	if ($mesg->code) {
+		syslog LOG_INFO, 'unable to do search: ' . $mesg->error;
+		return -$sys2err{(EX_TEMPFAIL)};
+	}
+
+	return -(ENOENT)
+		if (scalar($mesg->entries) == 0);
+
+	while (my $e = $mesg->shift_entry) {
+		my $key = $e->get_value($c{'user.key'}, asref => 1);
+		if (scalar(@$key) > 1) {
+			syslog LOG_INFO, $e->dn . " has multivalue $c{'user.key'}, ignoring";
+			next;
+		}
+
+		$cache{$key->[0]} = join "\n", @{$e->get_value('sshPublicKey', asref => 1)};
+	}
+
+	return EX_OK;
+}
+
+# TODO check ref() for non-ARRAYREF through
+sub loadcfg {
+	my $lpkconfig = shift;
+
+	my $cfg = Config::Simple->new;
+	unless ($cfg->read($lpkconfig)) {
+		print STDERR $cfg->error . "\n";
+		return -(EX_USAGE);
+	}
+
+	unless (defined($cfg->param('server.uri'))) {
+		print STDERR "server->uri must be defined\n";
+		return -(EX_CONFIG);
+	}
+
+	my @uri;
+	$c{'server.uri'} = [ ];
+	if (ref($cfg->param('server.uri')) eq 'ARRAYREF') {
+		@uri = @{$cfg->param('server.uri')};
+	} else {
+		@uri = ($cfg->param('server.uri'));
+	}
+	# TODO if SSL then check IO::Socket::SSL is available
+	foreach (@uri) {
+		my $u;
+		if ($_ =~ /^[a-z]+:/i) {
+			if ($_ =~ /^ldap[is]?:\/\/.*?(:\d+)?$/i) {
+				$u = URI->new($_);
+			}
+		} else {
+			$u = URI->new($_, 'ldap');
+		}
+
+		unless (defined($u)) {
+			print STDERR "invalid server uri ('$_'), ignoring\n";
+			next;
+		}
+
+		push @{$c{'server.uri'}}, ${$u->canonical};
+	}
+	unless (scalar @{$c{'server.uri'}} > 0) {
+		print STDERR "no valid LDAP servers given to connect to\n";
+		return -(EX_CONFIG);
+	}
+
+	if (defined($cfg->param('server.username'))) {
+		$c{'server.username'} = $cfg->param('server.username');
+
+		unless (defined($cfg->param('server.password'))) {
+			print STDERR "server->password must be defined\n";
+			return -(EX_CONFIG);
+		}
+	
+		$c{'server.password'} = $cfg->param('server.password');
+	}
+
+	$c{'server.timeout'} = (defined($cfg->param('server.timeout')))
+			? $cfg->param('server.timeout') : 5;
+	unless ($c{'server.timeout'} =~ /^\d+$/) {
+		print STDERR "server->timeout is not an integer, using 5\n";
+		$c{'server.timeout'} = 5;
+	}
+
+	unless (defined($cfg->param('user.key'))) {
+		print STDERR "user->key must be defined\n";
+		return -(EX_CONFIG);
+	}
+	$c{'user.base'} = $cfg->param('user.base');
+	unless (defined($cfg->param('user.base'))) {
+		print STDERR "user->base must be defined\n";
+		return -(EX_CONFIG);
+	}
+	$c{'user.key'} = $cfg->param('user.key');
+	if (defined($cfg->param('user.filter'))) {
+		$c{'user.filter'} = $cfg->param('user.filter');
+
+		$c{'user.filter'} = '(' . $c{'user.filter'} . ')'
+			unless ($c{'user.filter'} =~ /^\(.*\)$/);
+	} else {
+		print STDERR "user->filter should be defined\n";
+		$c{'user.filter'} = '';
+	}
+
+	return EX_OK;
+}
